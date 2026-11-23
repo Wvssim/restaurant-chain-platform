@@ -1,7 +1,7 @@
 package com.restochain.commandesservice.service;
 
-import com.restochain.commandesservice.client.MenuClient;
-import com.restochain.commandesservice.client.SuccursaleClient;
+import com.restochain.commandesservice.client.ResilientMenuClient;
+import com.restochain.commandesservice.client.ResilientSuccursaleClient;
 import com.restochain.commandesservice.client.dto.PlatClientDto;
 import com.restochain.commandesservice.client.dto.ReservationStockRequest;
 import com.restochain.commandesservice.client.dto.SuccursaleClientDto;
@@ -14,6 +14,7 @@ import com.restochain.commandesservice.event.CommandeEventPublisher;
 import com.restochain.commandesservice.exception.*;
 import com.restochain.commandesservice.repository.CommandeRepository;
 import feign.FeignException;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -29,14 +30,14 @@ public class CommandeService {
 
     private final CommandeRepository commandeRepository;
     private final TransitionStatutValidator transitionStatutValidator;
-    private final SuccursaleClient succursaleClient;
-    private final MenuClient menuClient;
+    private final ResilientSuccursaleClient succursaleClient;
+    private final ResilientMenuClient menuClient;
     private final CommandeEventPublisher commandeEventPublisher;
 
     public CommandeService(CommandeRepository commandeRepository,
                             TransitionStatutValidator transitionStatutValidator,
-                            SuccursaleClient succursaleClient,
-                            MenuClient menuClient,
+                            ResilientSuccursaleClient succursaleClient,
+                            ResilientMenuClient menuClient,
                             CommandeEventPublisher commandeEventPublisher) {
         this.commandeRepository = commandeRepository;
         this.transitionStatutValidator = transitionStatutValidator;
@@ -113,7 +114,7 @@ public class CommandeService {
             return succursaleClient.getSuccursaleById(succursaleId);
         } catch (FeignException.NotFound e) {
             throw new RessourceIntrouvableException("Succursale introuvable");
-        } catch (FeignException e) {
+        } catch (CallNotPermittedException | FeignException e) {
             log.warn("Appel a succursales-service en echec pour l'id {}", succursaleId, e);
             throw new ServiceIndisponibleException("succursales-service", e);
         }
@@ -124,7 +125,7 @@ public class CommandeService {
             return menuClient.getPlatById(platId);
         } catch (FeignException.NotFound e) {
             throw new RessourceIntrouvableException("Plat introuvable");
-        } catch (FeignException e) {
+        } catch (CallNotPermittedException | FeignException e) {
             log.warn("Appel a menu-service en echec pour le plat {}", platId, e);
             throw new ServiceIndisponibleException("menu-service", e);
         }
@@ -137,7 +138,7 @@ public class CommandeService {
             throw new StockInsuffisantException(plat.getNom());
         } catch (FeignException.BadRequest e) {
             throw new DonneesInvalidesException("Quantite invalide pour le plat '" + plat.getNom() + "'");
-        } catch (FeignException e) {
+        } catch (CallNotPermittedException | FeignException e) {
             log.warn("Appel de reservation de stock en echec pour le plat {}", plat.getId(), e);
             throw new ServiceIndisponibleException("menu-service", e);
         }

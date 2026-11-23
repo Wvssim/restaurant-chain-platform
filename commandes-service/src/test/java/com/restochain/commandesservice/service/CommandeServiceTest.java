@@ -1,7 +1,7 @@
 package com.restochain.commandesservice.service;
 
-import com.restochain.commandesservice.client.MenuClient;
-import com.restochain.commandesservice.client.SuccursaleClient;
+import com.restochain.commandesservice.client.ResilientMenuClient;
+import com.restochain.commandesservice.client.ResilientSuccursaleClient;
 import com.restochain.commandesservice.client.dto.PlatClientDto;
 import com.restochain.commandesservice.client.dto.ReservationStockRequest;
 import com.restochain.commandesservice.client.dto.SuccursaleClientDto;
@@ -18,6 +18,8 @@ import feign.FeignException;
 import feign.Request;
 import feign.RequestTemplate;
 import feign.Response;
+import io.github.resilience4j.circuitbreaker.CallNotPermittedException;
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mock;
@@ -39,9 +41,9 @@ class CommandeServiceTest {
     @Mock
     private CommandeRepository commandeRepository;
     @Mock
-    private SuccursaleClient succursaleClient;
+    private ResilientSuccursaleClient succursaleClient;
     @Mock
-    private MenuClient menuClient;
+    private ResilientMenuClient menuClient;
     @Mock
     private CommandeEventPublisher commandeEventPublisher;
 
@@ -164,5 +166,16 @@ class CommandeServiceTest {
 
         assertThrows(ServiceIndisponibleException.class,
                 () -> commandeService.createCommande(dtoCreation(1L, 10L, 1), "k6"));
+    }
+
+    @Test
+    void circuit_ouvert_devient_service_indisponible() {
+        when(commandeRepository.findByIdempotencyKey(anyString())).thenReturn(Optional.empty());
+        CircuitBreaker circuitBreaker = CircuitBreaker.ofDefaults("succursalesService");
+        when(succursaleClient.getSuccursaleById(1L))
+                .thenThrow(CallNotPermittedException.createCallNotPermittedException(circuitBreaker));
+
+        assertThrows(ServiceIndisponibleException.class,
+                () -> commandeService.createCommande(dtoCreation(1L, 10L, 1), "k7"));
     }
 }

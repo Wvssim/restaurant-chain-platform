@@ -4,7 +4,7 @@ Plateforme de gestion pour une **chaîne de restaurants multi-succursales**, bâ
 
 Chaque succursale gère son propre menu et ses propres commandes. Une commande suit un **workflow d'états** représentant son cycle de vie réel en salle : reçue par le serveur, préparée en cuisine, prête, servie, puis payée — avec possibilité d'annulation tant qu'elle n'a pas été servie.
 
-> **État du projet : jalon v5.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, communiquent entre eux via OpenFeign lors de la création d'une commande, et publient désormais des événements RabbitMQ consommés de façon asynchrone par `notifications-service`. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
+> **État du projet : jalon v6.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, communiquent entre eux via OpenFeign (avec Circuit Breaker et Retry) lors de la création d'une commande, et publient des événements RabbitMQ consommés de façon asynchrone par `notifications-service`. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
 
 ## Sommaire
 
@@ -14,6 +14,7 @@ Chaque succursale gère son propre menu et ses propres commandes. Une commande s
 - [Architecture — état actuel](#architecture--état-actuel)
 - [Communication interservices (OpenFeign)](#communication-interservices-openfeign)
 - [Communication asynchrone (RabbitMQ)](#communication-asynchrone-rabbitmq)
+- [Résilience (Circuit Breaker, Retry)](#résilience-circuit-breaker-retry)
 - [Démarrage](#démarrage)
 - [Feuille de route](#feuille-de-route)
 - [Historique des versions](#historique-des-versions)
@@ -211,6 +212,16 @@ flowchart LR
 
 La publication est **best-effort** : si RabbitMQ est indisponible, `commandes-service` journalise un avertissement et poursuit normalement (la création/mise à jour de la commande reste la donnée de référence ; la notification est un canal annexe, pas une dépendance bloquante).
 
+## Résilience (Circuit Breaker, Retry)
+
+Les appels OpenFeign de `commandes-service` vers `succursales-service` et `menu-service` sont enveloppés (`ResilientSuccursaleClient`, `ResilientMenuClient`) avec **Resilience4j** :
+
+- **Retry** — jusqu'à 3 tentatives (attente 500 ms entre chaque) uniquement sur `feign.RetryableException`, c'est-à-dire une panne de connectivité (service injoignable, timeout). Une erreur métier (404, 409) est déterministe : la retenter ne changerait rien, elle n'est donc jamais retentée.
+- **Circuit Breaker** — après plusieurs échecs de connectivité consécutifs (fenêtre glissante de 10 appels, seuil de 50 %), le circuit s'ouvre et les appels suivants échouent immédiatement (`CallNotPermittedException`, traduite en `ServiceIndisponibleException` / 503) au lieu d'attendre inutilement un service down. Il se referme automatiquement après 10 secondes pour retester. Comme pour le Retry, seules les pannes de connectivité comptent dans le taux d'échec — une 404 ne doit pas faire croire que le service est en panne.
+- **Idempotence** — déjà en place depuis le jalon v4.0 (en-tête `idempotencyKey` sur `POST /commandes/new`) : une requête rejouée après un retry côté client ne crée jamais de doublon.
+
+État des circuits consultable via `http://localhost:8083/actuator/circuitbreakers` (et l'historique des événements via `/actuator/circuitbreakerevents`).
+
 ## Démarrage
 
 Prérequis : JDK 17, et un broker RabbitMQ local pour tester la publication/consommation d'événements (sinon la plateforme fonctionne quand même, en mode dégradé — voir [Communication asynchrone](#communication-asynchrone-rabbitmq)) :
@@ -277,10 +288,17 @@ Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée 
 | v3.0 | Config Server | Partiel (serveur créé, migration des services restante) |
 | v4.0 | Communication synchrone (OpenFeign) | Fait |
 | v5.0 | Communication asynchrone (RabbitMQ) | Fait |
-| v6.0 | Résilience (Circuit Breaker, Retry, idempotence) | À venir |
+| v6.0 | Résilience (Circuit Breaker, Retry, idempotence) | Fait |
 | v7.0 | Migration RabbitMQ → Kafka | À venir |
 
 ## Historique des versions
+
+### v6.0
+- Ajout de **Resilience4j** (`resilience4j-spring-boot3`) sur `commandes-service` : les appels Feign vers `succursales-service` et `menu-service` passent désormais par `ResilientSuccursaleClient` / `ResilientMenuClient`.
+- **Retry** (3 tentatives, 500 ms) et **Circuit Breaker** (fenêtre de 10 appels, seuil 50 %, réouverture après 10 s) configurés pour ne réagir qu'aux pannes de connectivité (`feign.RetryableException`), jamais aux erreurs métier déterministes (404/409).
+- `CallNotPermittedException` (circuit ouvert) traduite en `ServiceIndisponibleException` (503), au même titre qu'une panne de connectivité classique.
+- Endpoints Actuator `circuitbreakers` et `circuitbreakerevents` exposés pour inspecter l'état des circuits.
+- L'idempotence sur `POST /commandes/new` (jalon v4.0) complète ce jalon : elle protège déjà contre les doublons créés par un client qui retenterait sa requête après un timeout.
 
 ### v5.0
 - Ajout de `notifications-service` (8084) : consomme les événements de commande et conserve un historique interrogeable (`GET /notifications`, `GET /notifications/commande/{id}`).
