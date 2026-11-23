@@ -5,9 +5,18 @@ import java.math.BigDecimal;
 public class LigneCommandeDto {
     private Long id;
     private Long platId;
+    private String platNom;
     private int quantite;
     private BigDecimal prixUnitaire;
     private BigDecimal sousTotal;
+
+    public String getPlatNom() {
+        return platNom;
+    }
+
+    public void setPlatNom(String platNom) {
+        this.platNom = platNom;
+    }
 
     public Long getId() {
         return id;

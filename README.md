@@ -4,14 +4,15 @@ Plateforme de gestion pour une **chaîne de restaurants multi-succursales**, bâ
 
 Chaque succursale gère son propre menu et ses propres commandes. Une commande suit un **workflow d'états** représentant son cycle de vie réel en salle : reçue par le serveur, préparée en cuisine, prête, servie, puis payée — avec possibilité d'annulation tant qu'elle n'a pas été servie.
 
-> **État du projet : jalon v2.0.** Les services métier sont enregistrés auprès d'un registre Eureka et accessibles via une passerelle API (routage statique et dynamique). La configuration centralisée et la communication interservices sont prévues aux jalons suivants (voir [Feuille de route](#feuille-de-route)). Ce README est mis à jour à chaque jalon livré.
+> **État du projet : jalon v4.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, et communiquent entre eux via OpenFeign lors de la création d'une commande. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
 
 ## Sommaire
 
 - [Description](#description)
 - [Modèle de données (UML)](#modèle-de-données-uml)
 - [Workflow d'une commande](#workflow-dune-commande)
-- [Architecture — état actuel (v2.0)](#architecture--état-actuel-v20)
+- [Architecture — état actuel](#architecture--état-actuel)
+- [Communication interservices (OpenFeign)](#communication-interservices-openfeign)
 - [Démarrage](#démarrage)
 - [Feuille de route](#feuille-de-route)
 - [Historique des versions](#historique-des-versions)
@@ -30,7 +31,7 @@ Chaque service expose une API REST (couches Controller / Service / Repository, D
 
 ## Modèle de données (UML)
 
-Les flèches pleines représentent les relations internes à un service (JPA). Les flèches pointillées représentent une **dépendance logique inter-services** (référence par identifiant uniquement ; aucun appel réseau n'est encore implémenté — prévu au jalon OpenFeign) :
+Les flèches pleines représentent les relations internes à un service (JPA). Les flèches pointillées représentent une **dépendance inter-services** : `commandes-service` vérifie et enrichit ces références par un appel OpenFeign réel ; `menu-service` ne fait que stocker `succursaleId` sans appeler `succursales-service` :
 
 ```mermaid
 classDiagram
@@ -128,9 +129,9 @@ stateDiagram-v2
 
 Transition réalisée via `PATCH /commandes/{id}/statut`.
 
-## Architecture — état actuel (v2.0)
+## Architecture — état actuel
 
-Les trois services métier s'enregistrent désormais auprès d'un registre **Eureka**, et sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service) :
+Les trois services métier s'enregistrent auprès d'un registre **Eureka**, sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service), et `commandes-service` appelle directement `succursales-service` et `menu-service` via **OpenFeign** pour valider et enrichir ses commandes :
 
 ```mermaid
 flowchart LR
@@ -138,10 +139,13 @@ flowchart LR
     GW --> A["succursales-service<br/>:8081"]
     GW --> B["menu-service<br/>:8082"]
     GW --> C["commandes-service<br/>:8083"]
+    C -- "Feign : verifier/enrichir" --> A
+    C -- "Feign : verifier/reserver stock" --> B
     A -. s'enregistre .-> EU["eureka-server<br/>:8761"]
     B -. s'enregistre .-> EU
     C -. s'enregistre .-> EU
     GW -. consulte le registre .-> EU
+    CS["config-server<br/>:8888"] -. lit .-> CR["config-repo"]
 ```
 
 | Application | Port |
@@ -151,6 +155,9 @@ flowchart LR
 | `succursales-service` | 8081 |
 | `menu-service` | 8082 |
 | `commandes-service` | 8083 |
+| `config-server` | 8888 |
+
+`config-server` sert la configuration centralisée depuis `config-repo` (profil `native`), mais aucun service ne la consomme encore — ils gardent pour l'instant leur `application.properties` local (migration restante du jalon v3.0).
 
 ### Routage statique vs dynamique
 
@@ -158,6 +165,27 @@ flowchart LR
 - **Dynamique** (`application-dynamique.properties`) : les routes sont générées automatiquement pour chaque service présent dans le registre (`discovery.locator`), via `/succursales-service/succursales`, `/menu-service/plats`, `/commandes-service/commandes`.
 
 Un seul profil est actif à la fois (même module, port 8080).
+
+## Communication interservices (OpenFeign)
+
+À la création d'une commande (`POST /commandes/new`), `commandes-service` ne fait plus confiance aux identifiants reçus : il vérifie chaque référence auprès du service propriétaire avant d'enregistrer quoi que ce soit.
+
+1. **Succursale** — `SuccursaleClient` interroge `succursales-service` ; la commande est refusée si la succursale est introuvable ou si elle est fermée (`FERMEE`).
+2. **Plats** — pour chaque ligne, `MenuClient` interroge `menu-service` : le plat doit exister, appartenir à la même succursale, et son stock est réservé via `POST /plats/{id}/stock/reserver` (verrou pessimiste côté `menu-service`). Le prix unitaire vient du serveur (`menu-service`), jamais du client.
+3. **Idempotence** — l'en-tête `idempotencyKey` est obligatoire ; une seconde requête avec la même clé renvoie la commande déjà créée au lieu d'en créer une seconde (utile en cas de retentative réseau depuis le client).
+4. **Gestion des erreurs** — les réponses des services distants sont traduites en erreurs métier locales :
+
+   | Situation distante | Exception locale | HTTP |
+   |---|---|---|
+   | Succursale ou plat introuvable (404) | `RessourceIntrouvableException` | 404 |
+   | Succursale fermée | `SuccursaleFermeeException` | 409 |
+   | Plat d'une autre succursale | `DonneesInvalidesException` | 400 |
+   | Stock insuffisant (409 de `menu-service`) | `StockInsuffisantException` | 409 |
+   | Service distant injoignable / timeout | `ServiceIndisponibleException` | 503 |
+
+**Consultation enrichie** — `GET /commandes/{id}` complète la réponse avec le nom/ville de la succursale et le nom de chaque plat (récupérés via Feign). Contrairement à la création, une consultation ne doit pas échouer à cause d'une dépendance en panne : l'enrichissement se dégrade silencieusement (champs laissés vides) si `succursales-service` ou `menu-service` est indisponible.
+
+Limite connue à ce jalon : si la réservation de stock échoue sur une ligne après avoir réussi sur une ligne précédente, le stock déjà réservé n'est pas restitué (pas de compensation/saga). Une piste pour un jalon ultérieur si le besoin se confirme.
 
 ## Démarrage
 
@@ -167,11 +195,14 @@ Prérequis : JDK 17.
 .\mvnw.cmd clean verify
 
 .\mvnw.cmd -pl eureka-server spring-boot:run
+.\mvnw.cmd -pl config-server spring-boot:run
 .\mvnw.cmd -pl succursales-service spring-boot:run
 .\mvnw.cmd -pl menu-service spring-boot:run
 .\mvnw.cmd -pl commandes-service spring-boot:run
 .\mvnw.cmd -pl gateway-service spring-boot:run "-Dspring-boot.run.profiles=dynamique"
 ```
+
+(`config-server` n'est pas encore consommé par les autres services — son démarrage n'est pas indispensable pour tester le reste de la plateforme)
 
 (remplacer `dynamique` par `statique` pour l'autre mode de routage)
 
@@ -212,13 +243,25 @@ Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée 
 | Init | Conception, UML, architecture | Fait |
 | v1.0 | Services métier | Fait |
 | v2.0 | Eureka + API Gateway (routage statique et dynamique) | Fait |
-| v3.0 | Config Server | À venir |
-| v4.0 | Communication synchrone (OpenFeign) | À venir |
+| v3.0 | Config Server | Partiel (serveur créé, migration des services restante) |
+| v4.0 | Communication synchrone (OpenFeign) | Fait |
 | v5.0 | Communication asynchrone (RabbitMQ) | À venir |
 | v6.0 | Résilience (Circuit Breaker, Retry, idempotence) | À venir |
 | v7.0 | Migration RabbitMQ → Kafka | À venir |
 
 ## Historique des versions
+
+### v4.0
+- `commandes-service` communique avec `succursales-service` et `menu-service` via **OpenFeign** (`SuccursaleClient`, `MenuClient`), résolus par Eureka.
+- Création de commande contrôlée : vérification de la succursale (existence + statut ouvert), vérification que chaque plat appartient à la bonne succursale, réservation réelle du stock, prix calculé côté serveur.
+- Idempotence sur `POST /commandes/new` via l'en-tête `idempotencyKey` : une requête rejouée renvoie la commande déjà créée.
+- Gestion différenciée des erreurs distantes : 404 → ressource introuvable, 409 → stock insuffisant ou succursale fermée, erreur de communication → 503 (`ServiceIndisponibleException`).
+- `GET /commandes/{id}` enrichi avec le nom/ville de la succursale et le nom de chaque plat, avec dégradation silencieuse si un service distant est indisponible.
+- Tests unitaires de `CommandeService` avec les clients Feign mockés (idempotence, règles métier, traduction des erreurs).
+
+### v3.0 (partiel)
+- Ajout de `config-server` (8888, `@EnableConfigServer`, profil `native`) et de `config-repo/application.properties` (configuration globale partagée : registre Eureka, exposition Actuator).
+- Migration des services métier vers cette configuration centralisée non encore réalisée.
 
 ### v2.0
 - Ajout de `eureka-server` (8761) : registre de services, ne s'enregistre pas lui-même (`register-with-eureka=false`, `fetch-registry=false`).

@@ -9,11 +9,29 @@ import java.util.List;
 public class CommandeDtoDetail {
     private Long id;
     private Long succursaleId;
+    private String succursaleNom;
+    private String succursaleVille;
     private Integer numeroTable;
     private Date dateCommande;
     private List<LigneCommandeDto> lignesCommande;
     private BigDecimal prixTotal;
     private StatutCommande statut;
+
+    public String getSuccursaleNom() {
+        return succursaleNom;
+    }
+
+    public void setSuccursaleNom(String succursaleNom) {
+        this.succursaleNom = succursaleNom;
+    }
+
+    public String getSuccursaleVille() {
+        return succursaleVille;
+    }
+
+    public void setSuccursaleVille(String succursaleVille) {
+        this.succursaleVille = succursaleVille;
+    }
 
     public Long getId() {
         return id;

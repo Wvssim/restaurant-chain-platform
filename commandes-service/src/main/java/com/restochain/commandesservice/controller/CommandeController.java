@@ -36,8 +36,10 @@ public class CommandeController {
     @PostMapping("/new")
     public ResponseEntity<CommandeDtoDetail> createCommande(@Valid @RequestBody CreateCommandeDto createCommandeDto,
                                                               @NotBlank @Size(max = 255) @RequestHeader(name = "idempotencyKey") String idempotency) {
-        Commande commande = commandeService.createCommande(commandeMapper.toEntity(createCommandeDto), idempotency);
-        return ResponseEntity.status(HttpStatus.CREATED).body(commandeMapperDetail.toDto(commande));
+        Commande commande = commandeService.createCommande(createCommandeDto, idempotency);
+        CommandeDtoDetail dto = commandeMapperDetail.toDto(commande);
+        commandeService.enrichir(dto);
+        return ResponseEntity.status(HttpStatus.CREATED).body(dto);
     }
 
     @GetMapping
@@ -48,14 +50,18 @@ public class CommandeController {
     @GetMapping("/{id}")
     public ResponseEntity<CommandeDtoDetail> getCommandeById(@PathVariable Long id) {
         Commande commande = commandeService.getCommandeById(id);
-        return ResponseEntity.ok(commandeMapperDetail.toDto(commande));
+        CommandeDtoDetail dto = commandeMapperDetail.toDto(commande);
+        commandeService.enrichir(dto);
+        return ResponseEntity.ok(dto);
     }
 
     @PatchMapping("/{id}/statut")
     public ResponseEntity<CommandeDtoDetail> changerStatut(@PathVariable Long id,
                                                              @Valid @RequestBody ChangerStatutDto changerStatutDto) {
         Commande commande = commandeService.changerStatut(id, changerStatutDto.getNouveauStatut());
-        return ResponseEntity.ok(commandeMapperDetail.toDto(commande));
+        CommandeDtoDetail dto = commandeMapperDetail.toDto(commande);
+        commandeService.enrichir(dto);
+        return ResponseEntity.ok(dto);
     }
 
     @ExceptionHandler(ConstraintViolationException.class)
