@@ -14,5 +14,7 @@
         <module>succursales-service</module>
         <module>menu-service</module>
         <module>commandes-service</module>
+        <module>eureka-server</module>
+        <module>gateway-service</module>
     </modules>
 </project>

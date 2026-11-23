@@ -4,14 +4,14 @@ Plateforme de gestion pour une **chaîne de restaurants multi-succursales**, bâ
 
 Chaque succursale gère son propre menu et ses propres commandes. Une commande suit un **workflow d'états** représentant son cycle de vie réel en salle : reçue par le serveur, préparée en cuisine, prête, servie, puis payée — avec possibilité d'annulation tant qu'elle n'a pas été servie.
 
-> **État du projet : jalon v1.0.** Seuls les services métier ci-dessous sont implémentés. Le registre de service, la passerelle, la configuration centralisée et la communication interservices sont prévus aux jalons suivants (voir [Feuille de route](#feuille-de-route)). Ce README est mis à jour à chaque jalon livré.
+> **État du projet : jalon v2.0.** Les services métier sont enregistrés auprès d'un registre Eureka et accessibles via une passerelle API (routage statique et dynamique). La configuration centralisée et la communication interservices sont prévues aux jalons suivants (voir [Feuille de route](#feuille-de-route)). Ce README est mis à jour à chaque jalon livré.
 
 ## Sommaire
 
 - [Description](#description)
 - [Modèle de données (UML)](#modèle-de-données-uml)
 - [Workflow d'une commande](#workflow-dune-commande)
-- [Architecture — état actuel (v1.0)](#architecture--état-actuel-v10)
+- [Architecture — état actuel (v2.0)](#architecture--état-actuel-v20)
 - [Démarrage](#démarrage)
 - [Feuille de route](#feuille-de-route)
 - [Historique des versions](#historique-des-versions)
@@ -128,21 +128,36 @@ stateDiagram-v2
 
 Transition réalisée via `PATCH /commandes/{id}/statut`.
 
-## Architecture — état actuel (v1.0)
+## Architecture — état actuel (v2.0)
 
-Les trois services tournent **indépendamment**, chacun avec sa base H2 propre, sans découverte de service ni passerelle pour l'instant :
+Les trois services métier s'enregistrent désormais auprès d'un registre **Eureka**, et sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service) :
 
 ```mermaid
 flowchart LR
-    subgraph "v1.0 — implémenté"
-        A["succursales-service<br/>:8081"]
-        B["menu-service<br/>:8082"]
-        C["commandes-service<br/>:8083"]
-    end
-    Client(["Client / Postman"]) -.-> A
-    Client -.-> B
-    Client -.-> C
+    Client(["Client / Postman"]) --> GW["gateway-service<br/>:8080"]
+    GW --> A["succursales-service<br/>:8081"]
+    GW --> B["menu-service<br/>:8082"]
+    GW --> C["commandes-service<br/>:8083"]
+    A -. s'enregistre .-> EU["eureka-server<br/>:8761"]
+    B -. s'enregistre .-> EU
+    C -. s'enregistre .-> EU
+    GW -. consulte le registre .-> EU
 ```
+
+| Application | Port |
+|---|---|
+| `eureka-server` | 8761 |
+| `gateway-service` | 8080 |
+| `succursales-service` | 8081 |
+| `menu-service` | 8082 |
+| `commandes-service` | 8083 |
+
+### Routage statique vs dynamique
+
+- **Statique** (`application-statique.properties`) : les routes `lb://SUCCURSALES-SERVICE`, `lb://MENU-SERVICE`, `lb://COMMANDES-SERVICE` sont déclarées explicitement, mais l'adresse/port de chaque instance reste résolu via Eureka.
+- **Dynamique** (`application-dynamique.properties`) : les routes sont générées automatiquement pour chaque service présent dans le registre (`discovery.locator`), via `/succursales-service/succursales`, `/menu-service/plats`, `/commandes-service/commandes`.
+
+Un seul profil est actif à la fois (même module, port 8080).
 
 ## Démarrage
 
@@ -151,12 +166,16 @@ Prérequis : JDK 17.
 ```powershell
 .\mvnw.cmd clean verify
 
+.\mvnw.cmd -pl eureka-server spring-boot:run
 .\mvnw.cmd -pl succursales-service spring-boot:run
 .\mvnw.cmd -pl menu-service spring-boot:run
 .\mvnw.cmd -pl commandes-service spring-boot:run
+.\mvnw.cmd -pl gateway-service spring-boot:run "-Dspring-boot.run.profiles=dynamique"
 ```
 
-Vérification rapide :
+(remplacer `dynamique` par `statique` pour l'autre mode de routage)
+
+Vérification rapide — directement sur les services métier :
 
 ```text
 http://localhost:8081/succursales
@@ -164,17 +183,35 @@ http://localhost:8082/plats
 http://localhost:8083/commandes
 ```
 
-Documentation interactive (Swagger UI) sur chaque service : `http://localhost:<port>/swagger-ui.html`.
+Via la Gateway (profil `statique`) :
+
+```text
+http://localhost:8080/succursales
+http://localhost:8080/plats
+http://localhost:8080/commandes
+```
+
+Via la Gateway (profil `dynamique`) :
+
+```text
+http://localhost:8080/succursales-service/succursales
+http://localhost:8080/menu-service/plats
+http://localhost:8080/commandes-service/commandes
+```
+
+Registre Eureka : `http://localhost:8761`. Routes de la Gateway : `http://localhost:8080/actuator/gateway/routes`.
+
+Documentation interactive (Swagger UI) sur chaque service métier : `http://localhost:<port>/swagger-ui.html`.
 
 ## Feuille de route
 
-Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée à ce projet. L'architecture cible complète (5 applications : 3 services métier + Eureka + Gateway, avant l'ajout ultérieur de Config Server, RabbitMQ puis Kafka) sera documentée et mise à jour ici à mesure de sa réalisation.
+Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée à ce projet.
 
 | Jalon | Contenu | Statut |
 |---|---|---|
 | Init | Conception, UML, architecture | Fait |
-| v1.0 | Services métier (ce README) | Fait |
-| v2.0 | Eureka + API Gateway | À venir |
+| v1.0 | Services métier | Fait |
+| v2.0 | Eureka + API Gateway (routage statique et dynamique) | Fait |
 | v3.0 | Config Server | À venir |
 | v4.0 | Communication synchrone (OpenFeign) | À venir |
 | v5.0 | Communication asynchrone (RabbitMQ) | À venir |
@@ -182,6 +219,14 @@ Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée 
 | v7.0 | Migration RabbitMQ → Kafka | À venir |
 
 ## Historique des versions
+
+### v2.0
+- Ajout de `eureka-server` (8761) : registre de services, ne s'enregistre pas lui-même (`register-with-eureka=false`, `fetch-registry=false`).
+- Ajout de `gateway-service` (8080, Spring Cloud Gateway sur WebFlux) avec deux profils :
+  - `statique` : routes déclarées explicitement (`lb://SUCCURSALES-SERVICE`, `lb://MENU-SERVICE`, `lb://COMMANDES-SERVICE`).
+  - `dynamique` : routes générées automatiquement par découverte de service (`discovery.locator`), préfixées par le nom du service.
+- Les trois services métier s'enregistrent désormais auprès d'Eureka (`spring-cloud-starter-netflix-eureka-client`).
+- Endpoint `/actuator/gateway/routes` exposé pour inspecter les routes actives.
 
 ### v1.0
 - Trois services métier opérationnels : `succursales-service`, `menu-service`, `commandes-service`.
