@@ -4,7 +4,7 @@ Plateforme de gestion pour une **chaîne de restaurants multi-succursales**, bâ
 
 Chaque succursale gère son propre menu et ses propres commandes. Une commande suit un **workflow d'états** représentant son cycle de vie réel en salle : reçue par le serveur, préparée en cuisine, prête, servie, puis payée — avec possibilité d'annulation tant qu'elle n'a pas été servie.
 
-> **État du projet : jalon v6.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, communiquent entre eux via OpenFeign (avec Circuit Breaker et Retry) lors de la création d'une commande, et publient des événements RabbitMQ consommés de façon asynchrone par `notifications-service`. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
+> **État du projet : jalon v7.0 (dernier jalon de la feuille de route).** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, communiquent entre eux via OpenFeign (avec Circuit Breaker et Retry) lors de la création d'une commande, et publient des événements **Kafka** consommés de façon asynchrone par `notifications-service` (migration depuis RabbitMQ). Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
 
 ## Sommaire
 
@@ -13,7 +13,7 @@ Chaque succursale gère son propre menu et ses propres commandes. Une commande s
 - [Workflow d'une commande](#workflow-dune-commande)
 - [Architecture — état actuel](#architecture--état-actuel)
 - [Communication interservices (OpenFeign)](#communication-interservices-openfeign)
-- [Communication asynchrone (RabbitMQ)](#communication-asynchrone-rabbitmq)
+- [Communication asynchrone (Kafka)](#communication-asynchrone-kafka)
 - [Résilience (Circuit Breaker, Retry)](#résilience-circuit-breaker-retry)
 - [Démarrage](#démarrage)
 - [Feuille de route](#feuille-de-route)
@@ -28,7 +28,7 @@ Le projet est découpé en services métier autonomes, chacun avec sa propre bas
 | `succursales-service` | Référentiel des succursales de la chaîne (adresse, ville, responsable, statut) | 8081 | `/succursales` |
 | `menu-service` | Plats proposés par chaque succursale, disponibilité et quantité restante du jour | 8082 | `/plats` |
 | `commandes-service` | Commandes passées en salle, lignes de commande, workflow de statuts | 8083 | `/commandes` |
-| `notifications-service` | Historique des notifications générées par le cycle de vie d'une commande (consommateur RabbitMQ) | 8084 | `/notifications` |
+| `notifications-service` | Historique des notifications générées par le cycle de vie d'une commande (consommateur Kafka) | 8084 | `/notifications` |
 
 Chaque service expose une API REST (couches Controller / Service / Repository, DTO validés, MapStruct pour le mapping, gestion d'erreurs par exceptions dédiées avec codes HTTP appropriés) et persiste ses données dans une base H2 en mémoire, peuplée au démarrage via `data.sql`.
 
@@ -134,7 +134,7 @@ Transition réalisée via `PATCH /commandes/{id}/statut`.
 
 ## Architecture — état actuel
 
-Les services métier s'enregistrent auprès d'un registre **Eureka**, sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service), `commandes-service` appelle directement `succursales-service` et `menu-service` via **OpenFeign** pour valider et enrichir ses commandes, et publie des événements sur **RabbitMQ** que `notifications-service` consomme de façon asynchrone :
+Les services métier s'enregistrent auprès d'un registre **Eureka**, sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service), `commandes-service` appelle directement `succursales-service` et `menu-service` via **OpenFeign** (avec Circuit Breaker et Retry) pour valider et enrichir ses commandes, et publie des événements sur **Kafka** que `notifications-service` consomme de façon asynchrone :
 
 ```mermaid
 flowchart LR
@@ -144,7 +144,7 @@ flowchart LR
     GW --> C["commandes-service<br/>:8083"]
     C -- "Feign : verifier/enrichir" --> A
     C -- "Feign : verifier/reserver stock" --> B
-    C -- publie --> MQ["RabbitMQ<br/>exchange commandes.events"]
+    C -- produit --> MQ["Kafka<br/>topic commandes-events"]
     MQ -- consomme --> N["notifications-service<br/>:8084"]
     A -. s'enregistre .-> EU["eureka-server<br/>:8761"]
     B -. s'enregistre .-> EU
@@ -194,23 +194,22 @@ Un seul profil est actif à la fois (même module, port 8080).
 
 Limite connue à ce jalon : si la réservation de stock échoue sur une ligne après avoir réussi sur une ligne précédente, le stock déjà réservé n'est pas restitué (pas de compensation/saga). Une piste pour un jalon ultérieur si le besoin se confirme.
 
-## Communication asynchrone (RabbitMQ)
+## Communication asynchrone (Kafka)
 
-En plus des appels synchrones OpenFeign (nécessaires pour valider une commande avant de l'enregistrer), `commandes-service` publie des **événements** décrivant le cycle de vie d'une commande, sans attendre ni connaître ses consommateurs :
+En plus des appels synchrones OpenFeign (nécessaires pour valider une commande avant de l'enregistrer), `commandes-service` publie des **événements** décrivant le cycle de vie d'une commande, sans attendre ni connaître ses consommateurs. Ce canal a été construit avec RabbitMQ au jalon v5.0, puis **migré vers Kafka** au jalon v7.0 : même rôle fonctionnel, autre technologie.
 
-- `commande.creee` : publié juste après l'enregistrement d'une nouvelle commande.
-- `commande.statut.changee` : publié après chaque transition de statut validée (`PATCH /commandes/{id}/statut`).
+- Un seul topic `commandes-events` (3 partitions), clé = id de la commande (garantit que tous les événements d'une même commande restent ordonnés sur la même partition).
+- Publié après l'enregistrement d'une nouvelle commande (statut `RECUE`), et après chaque transition de statut validée (`PATCH /commandes/{id}/statut`).
 
-Les deux routing keys sont envoyées sur l'exchange topic `commandes.events`. `notifications-service` déclare une queue `notifications.queue` liée avec le pattern `commande.#`, consomme ces événements (`@RabbitListener`) et les conserve comme historique consultable via `GET /notifications` (et `GET /notifications/commande/{id}`) — une simulation simple d'un canal de notification vers la cuisine ou le personnel de salle.
+`notifications-service` consomme ce topic (`@KafkaListener`, groupe `notifications-service`) et conserve les événements comme historique consultable via `GET /notifications` (et `GET /notifications/commande/{id}`) — une simulation simple d'un canal de notification vers la cuisine ou le personnel de salle.
 
 ```mermaid
 flowchart LR
-    C["commandes-service"] -- "commande.creee<br/>commande.statut.changee" --> EX(["exchange topic<br/>commandes.events"])
-    EX -- "commande.#" --> Q["queue<br/>notifications.queue"]
-    Q --> N["notifications-service"]
+    C["commandes-service"] -- "produit" --> T(["topic<br/>commandes-events<br/>(3 partitions)"])
+    T -- "consomme<br/>(groupe notifications-service)" --> N["notifications-service"]
 ```
 
-La publication est **best-effort** : si RabbitMQ est indisponible, `commandes-service` journalise un avertissement et poursuit normalement (la création/mise à jour de la commande reste la donnée de référence ; la notification est un canal annexe, pas une dépendance bloquante).
+La publication est **best-effort** : `KafkaTemplate.send()` est asynchrone (retourne un `Future`) — un échec synchrone (ex. erreur de sérialisation) comme un échec asynchrone (broker injoignable, timeout) est journalisé via un callback, sans jamais bloquer ni faire échouer la création/mise à jour de la commande, qui reste la donnée de référence.
 
 ## Résilience (Circuit Breaker, Retry)
 
@@ -224,10 +223,10 @@ Les appels OpenFeign de `commandes-service` vers `succursales-service` et `menu-
 
 ## Démarrage
 
-Prérequis : JDK 17, et un broker RabbitMQ local pour tester la publication/consommation d'événements (sinon la plateforme fonctionne quand même, en mode dégradé — voir [Communication asynchrone](#communication-asynchrone-rabbitmq)) :
+Prérequis : JDK 17, et un broker Kafka local pour tester la publication/consommation d'événements (sinon la plateforme fonctionne quand même, en mode dégradé — voir [Communication asynchrone](#communication-asynchrone-kafka)) :
 
 ```powershell
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+docker run -d --name kafka -p 9092:9092 apache/kafka:3.8.0
 ```
 
 ```powershell
@@ -244,7 +243,7 @@ docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
 
 (`config-server` n'est pas encore consommé par les autres services — son démarrage n'est pas indispensable pour tester le reste de la plateforme)
 
-Historique des notifications : `http://localhost:8084/notifications`. Console de gestion RabbitMQ : `http://localhost:15672` (guest / guest).
+Historique des notifications : `http://localhost:8084/notifications`.
 
 (remplacer `dynamique` par `statique` pour l'autre mode de routage)
 
@@ -289,9 +288,16 @@ Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée 
 | v4.0 | Communication synchrone (OpenFeign) | Fait |
 | v5.0 | Communication asynchrone (RabbitMQ) | Fait |
 | v6.0 | Résilience (Circuit Breaker, Retry, idempotence) | Fait |
-| v7.0 | Migration RabbitMQ → Kafka | À venir |
+| v7.0 | Migration RabbitMQ → Kafka | Fait |
 
 ## Historique des versions
+
+### v7.0
+- Migration du canal asynchrone de **RabbitMQ vers Kafka** : `commandes-service` produit sur un topic `commandes-events` (3 partitions, clé = id de la commande) au lieu de publier sur un exchange ; `notifications-service` consomme via `@KafkaListener` (groupe `notifications-service`) au lieu de `@RabbitListener`.
+- Sérialisation JSON (`JsonSerializer` / `JsonDeserializer`) configurée explicitement, comme c'était déjà le cas avec RabbitMQ (`Jackson2JsonMessageConverter`).
+- Publication toujours best-effort, mais désormais explicitement asynchrone : le `Future` retourné par `KafkaTemplate.send()` est traité par callback, les échecs (synchrones ou asynchrones) sont journalisés sans jamais bloquer la création/mise à jour d'une commande.
+- Tests du publisher étendus pour couvrir à la fois l'échec synchrone (ex. sérialisation) et l'échec asynchrone (ex. broker injoignable) sans propagation d'exception.
+- Dernier jalon de la feuille de route du module.
 
 ### v6.0
 - Ajout de **Resilience4j** (`resilience4j-spring-boot3`) sur `commandes-service` : les appels Feign vers `succursales-service` et `menu-service` passent désormais par `ResilientSuccursaleClient` / `ResilientMenuClient`.

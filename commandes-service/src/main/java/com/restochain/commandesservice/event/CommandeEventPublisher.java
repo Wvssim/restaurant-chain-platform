@@ -1,46 +1,52 @@
 package com.restochain.commandesservice.event;
 
-import com.restochain.commandesservice.config.RabbitMQConfig;
+import com.restochain.commandesservice.config.KafkaConfig;
 import com.restochain.commandesservice.entite.Commande;
+import org.apache.kafka.common.KafkaException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.amqp.AmqpException;
-import org.springframework.amqp.core.AmqpTemplate;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
 import java.util.Date;
 
 /**
- * Publie les evenements du cycle de vie d'une commande sur RabbitMQ. La publication est
- * best-effort : si le broker est indisponible, l'echec est journalise sans remonter au
- * client, car il s'agit d'une notification annexe et non d'une donnee metier critique.
+ * Publie les evenements du cycle de vie d'une commande sur Kafka (topic commandes-events,
+ * cle = id de la commande pour garder l'ordre des evenements d'une meme commande sur une
+ * meme partition). La publication est best-effort : un echec, synchrone (serialisation) ou
+ * asynchrone (broker injoignable, via le callback du Future retourne par send()), est
+ * journalise sans jamais remonter au client - il s'agit d'une notification annexe, pas
+ * d'une donnee metier critique.
  */
 @Component
 public class CommandeEventPublisher {
     private static final Logger log = LoggerFactory.getLogger(CommandeEventPublisher.class);
 
-    public static final String ROUTING_CREEE = "commande.creee";
-    public static final String ROUTING_STATUT_CHANGEE = "commande.statut.changee";
+    private final KafkaTemplate<String, CommandeEvent> kafkaTemplate;
 
-    private final AmqpTemplate amqpTemplate;
-
-    public CommandeEventPublisher(AmqpTemplate amqpTemplate) {
-        this.amqpTemplate = amqpTemplate;
+    public CommandeEventPublisher(KafkaTemplate<String, CommandeEvent> kafkaTemplate) {
+        this.kafkaTemplate = kafkaTemplate;
     }
 
     public void publierCreation(Commande commande) {
-        publier(ROUTING_CREEE, construireEvenement(commande, "Nouvelle commande recue"));
+        publier(construireEvenement(commande, "Nouvelle commande recue"));
     }
 
     public void publierChangementStatut(Commande commande) {
-        publier(ROUTING_STATUT_CHANGEE, construireEvenement(commande, "Statut de la commande mis a jour"));
+        publier(construireEvenement(commande, "Statut de la commande mis a jour"));
     }
 
-    private void publier(String routingKey, CommandeEvent event) {
+    private void publier(CommandeEvent event) {
         try {
-            amqpTemplate.convertAndSend(RabbitMQConfig.EXCHANGE_COMMANDES, routingKey, event);
-        } catch (AmqpException e) {
-            log.warn("Publication de l'evenement '{}' impossible (RabbitMQ indisponible) : {}", routingKey, e.getMessage());
+            kafkaTemplate.send(KafkaConfig.TOPIC_COMMANDES_EVENTS, event.getCommandeId().toString(), event)
+                    .whenComplete((result, exception) -> {
+                        if (exception != null) {
+                            log.warn("Publication Kafka de l'evenement pour la commande {} impossible : {}",
+                                    event.getCommandeId(), exception.getMessage());
+                        }
+                    });
+        } catch (KafkaException e) {
+            log.warn("Publication Kafka de l'evenement pour la commande {} impossible : {}", event.getCommandeId(), e.getMessage());
         }
     }
 
