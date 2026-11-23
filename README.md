@@ -4,7 +4,7 @@ Plateforme de gestion pour une **chaîne de restaurants multi-succursales**, bâ
 
 Chaque succursale gère son propre menu et ses propres commandes. Une commande suit un **workflow d'états** représentant son cycle de vie réel en salle : reçue par le serveur, préparée en cuisine, prête, servie, puis payée — avec possibilité d'annulation tant qu'elle n'a pas été servie.
 
-> **État du projet : jalon v4.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, et communiquent entre eux via OpenFeign lors de la création d'une commande. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
+> **État du projet : jalon v5.0.** Les services métier sont enregistrés auprès d'un registre Eureka, accessibles via une passerelle API, communiquent entre eux via OpenFeign lors de la création d'une commande, et publient désormais des événements RabbitMQ consommés de façon asynchrone par `notifications-service`. Le Config Server existe (`config-server` + `config-repo`) mais les services ne le consomment pas encore (jalon v3.0 partiel — migration restante). Voir [Feuille de route](#feuille-de-route). Ce README est mis à jour à chaque jalon livré.
 
 ## Sommaire
 
@@ -13,19 +13,21 @@ Chaque succursale gère son propre menu et ses propres commandes. Une commande s
 - [Workflow d'une commande](#workflow-dune-commande)
 - [Architecture — état actuel](#architecture--état-actuel)
 - [Communication interservices (OpenFeign)](#communication-interservices-openfeign)
+- [Communication asynchrone (RabbitMQ)](#communication-asynchrone-rabbitmq)
 - [Démarrage](#démarrage)
 - [Feuille de route](#feuille-de-route)
 - [Historique des versions](#historique-des-versions)
 
 ## Description
 
-Le projet est découpé en trois services métier autonomes, chacun avec sa propre base de données :
+Le projet est découpé en services métier autonomes, chacun avec sa propre base de données :
 
 | Service | Rôle | Port | Endpoint principal |
 |---|---|---|---|
 | `succursales-service` | Référentiel des succursales de la chaîne (adresse, ville, responsable, statut) | 8081 | `/succursales` |
 | `menu-service` | Plats proposés par chaque succursale, disponibilité et quantité restante du jour | 8082 | `/plats` |
 | `commandes-service` | Commandes passées en salle, lignes de commande, workflow de statuts | 8083 | `/commandes` |
+| `notifications-service` | Historique des notifications générées par le cycle de vie d'une commande (consommateur RabbitMQ) | 8084 | `/notifications` |
 
 Chaque service expose une API REST (couches Controller / Service / Repository, DTO validés, MapStruct pour le mapping, gestion d'erreurs par exceptions dédiées avec codes HTTP appropriés) et persiste ses données dans une base H2 en mémoire, peuplée au démarrage via `data.sql`.
 
@@ -131,7 +133,7 @@ Transition réalisée via `PATCH /commandes/{id}/statut`.
 
 ## Architecture — état actuel
 
-Les trois services métier s'enregistrent auprès d'un registre **Eureka**, sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service), et `commandes-service` appelle directement `succursales-service` et `menu-service` via **OpenFeign** pour valider et enrichir ses commandes :
+Les services métier s'enregistrent auprès d'un registre **Eureka**, sont accessibles via une **API Gateway** unique (deux profils : routage statique déclaratif, ou routage dynamique généré depuis la découverte de service), `commandes-service` appelle directement `succursales-service` et `menu-service` via **OpenFeign** pour valider et enrichir ses commandes, et publie des événements sur **RabbitMQ** que `notifications-service` consomme de façon asynchrone :
 
 ```mermaid
 flowchart LR
@@ -141,9 +143,12 @@ flowchart LR
     GW --> C["commandes-service<br/>:8083"]
     C -- "Feign : verifier/enrichir" --> A
     C -- "Feign : verifier/reserver stock" --> B
+    C -- publie --> MQ["RabbitMQ<br/>exchange commandes.events"]
+    MQ -- consomme --> N["notifications-service<br/>:8084"]
     A -. s'enregistre .-> EU["eureka-server<br/>:8761"]
     B -. s'enregistre .-> EU
     C -. s'enregistre .-> EU
+    N -. s'enregistre .-> EU
     GW -. consulte le registre .-> EU
     CS["config-server<br/>:8888"] -. lit .-> CR["config-repo"]
 ```
@@ -155,6 +160,7 @@ flowchart LR
 | `succursales-service` | 8081 |
 | `menu-service` | 8082 |
 | `commandes-service` | 8083 |
+| `notifications-service` | 8084 |
 | `config-server` | 8888 |
 
 `config-server` sert la configuration centralisée depuis `config-repo` (profil `native`), mais aucun service ne la consomme encore — ils gardent pour l'instant leur `application.properties` local (migration restante du jalon v3.0).
@@ -187,9 +193,31 @@ Un seul profil est actif à la fois (même module, port 8080).
 
 Limite connue à ce jalon : si la réservation de stock échoue sur une ligne après avoir réussi sur une ligne précédente, le stock déjà réservé n'est pas restitué (pas de compensation/saga). Une piste pour un jalon ultérieur si le besoin se confirme.
 
+## Communication asynchrone (RabbitMQ)
+
+En plus des appels synchrones OpenFeign (nécessaires pour valider une commande avant de l'enregistrer), `commandes-service` publie des **événements** décrivant le cycle de vie d'une commande, sans attendre ni connaître ses consommateurs :
+
+- `commande.creee` : publié juste après l'enregistrement d'une nouvelle commande.
+- `commande.statut.changee` : publié après chaque transition de statut validée (`PATCH /commandes/{id}/statut`).
+
+Les deux routing keys sont envoyées sur l'exchange topic `commandes.events`. `notifications-service` déclare une queue `notifications.queue` liée avec le pattern `commande.#`, consomme ces événements (`@RabbitListener`) et les conserve comme historique consultable via `GET /notifications` (et `GET /notifications/commande/{id}`) — une simulation simple d'un canal de notification vers la cuisine ou le personnel de salle.
+
+```mermaid
+flowchart LR
+    C["commandes-service"] -- "commande.creee<br/>commande.statut.changee" --> EX(["exchange topic<br/>commandes.events"])
+    EX -- "commande.#" --> Q["queue<br/>notifications.queue"]
+    Q --> N["notifications-service"]
+```
+
+La publication est **best-effort** : si RabbitMQ est indisponible, `commandes-service` journalise un avertissement et poursuit normalement (la création/mise à jour de la commande reste la donnée de référence ; la notification est un canal annexe, pas une dépendance bloquante).
+
 ## Démarrage
 
-Prérequis : JDK 17.
+Prérequis : JDK 17, et un broker RabbitMQ local pour tester la publication/consommation d'événements (sinon la plateforme fonctionne quand même, en mode dégradé — voir [Communication asynchrone](#communication-asynchrone-rabbitmq)) :
+
+```powershell
+docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
+```
 
 ```powershell
 .\mvnw.cmd clean verify
@@ -199,10 +227,13 @@ Prérequis : JDK 17.
 .\mvnw.cmd -pl succursales-service spring-boot:run
 .\mvnw.cmd -pl menu-service spring-boot:run
 .\mvnw.cmd -pl commandes-service spring-boot:run
+.\mvnw.cmd -pl notifications-service spring-boot:run
 .\mvnw.cmd -pl gateway-service spring-boot:run "-Dspring-boot.run.profiles=dynamique"
 ```
 
 (`config-server` n'est pas encore consommé par les autres services — son démarrage n'est pas indispensable pour tester le reste de la plateforme)
+
+Historique des notifications : `http://localhost:8084/notifications`. Console de gestion RabbitMQ : `http://localhost:15672` (guest / guest).
 
 (remplacer `dynamique` par `statique` pour l'autre mode de routage)
 
@@ -245,11 +276,17 @@ Chaque jalon ajoute une brique d'infrastructure ou de communication, appliquée 
 | v2.0 | Eureka + API Gateway (routage statique et dynamique) | Fait |
 | v3.0 | Config Server | Partiel (serveur créé, migration des services restante) |
 | v4.0 | Communication synchrone (OpenFeign) | Fait |
-| v5.0 | Communication asynchrone (RabbitMQ) | À venir |
+| v5.0 | Communication asynchrone (RabbitMQ) | Fait |
 | v6.0 | Résilience (Circuit Breaker, Retry, idempotence) | À venir |
 | v7.0 | Migration RabbitMQ → Kafka | À venir |
 
 ## Historique des versions
+
+### v5.0
+- Ajout de `notifications-service` (8084) : consomme les événements de commande et conserve un historique interrogeable (`GET /notifications`, `GET /notifications/commande/{id}`).
+- `commandes-service` publie deux événements via **RabbitMQ** (exchange topic `commandes.events`) : `commande.creee` à la création, `commande.statut.changee` à chaque transition de statut validée.
+- Publication best-effort : une panne du broker est journalisée côté `commandes-service` sans jamais faire échouer la création ou la mise à jour d'une commande.
+- Tests unitaires du publisher (routing keys, dégradation si RabbitMQ indisponible) et du service de notifications.
 
 ### v4.0
 - `commandes-service` communique avec `succursales-service` et `menu-service` via **OpenFeign** (`SuccursaleClient`, `MenuClient`), résolus par Eureka.

@@ -7,6 +7,7 @@ import com.restochain.commandesservice.client.dto.ReservationStockRequest;
 import com.restochain.commandesservice.client.dto.SuccursaleClientDto;
 import com.restochain.commandesservice.dto.CreateCommandeDto;
 import com.restochain.commandesservice.entite.Commande;
+import com.restochain.commandesservice.event.CommandeEventPublisher;
 import com.restochain.commandesservice.exception.DonneesInvalidesException;
 import com.restochain.commandesservice.exception.RessourceIntrouvableException;
 import com.restochain.commandesservice.exception.ServiceIndisponibleException;
@@ -41,13 +42,15 @@ class CommandeServiceTest {
     private SuccursaleClient succursaleClient;
     @Mock
     private MenuClient menuClient;
+    @Mock
+    private CommandeEventPublisher commandeEventPublisher;
 
     private CommandeService commandeService;
 
     @BeforeEach
     void setUp() {
         MockitoAnnotations.openMocks(this);
-        commandeService = new CommandeService(commandeRepository, new TransitionStatutValidator(), succursaleClient, menuClient);
+        commandeService = new CommandeService(commandeRepository, new TransitionStatutValidator(), succursaleClient, menuClient, commandeEventPublisher);
         when(commandeRepository.save(any(Commande.class))).thenAnswer(invocation -> invocation.getArgument(0));
     }
 
@@ -98,6 +101,7 @@ class CommandeServiceTest {
 
         assertEquals(new BigDecimal("190.00"), commande.getPrixTotal());
         verify(menuClient).reserverStock(eq(10L), any(ReservationStockRequest.class));
+        verify(commandeEventPublisher).publierCreation(commande);
     }
 
     @Test

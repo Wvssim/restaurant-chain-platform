@@ -10,6 +10,7 @@ import com.restochain.commandesservice.dto.CreateCommandeDto;
 import com.restochain.commandesservice.entite.Commande;
 import com.restochain.commandesservice.entite.LigneCommande;
 import com.restochain.commandesservice.enums.StatutCommande;
+import com.restochain.commandesservice.event.CommandeEventPublisher;
 import com.restochain.commandesservice.exception.*;
 import com.restochain.commandesservice.repository.CommandeRepository;
 import feign.FeignException;
@@ -30,15 +31,18 @@ public class CommandeService {
     private final TransitionStatutValidator transitionStatutValidator;
     private final SuccursaleClient succursaleClient;
     private final MenuClient menuClient;
+    private final CommandeEventPublisher commandeEventPublisher;
 
     public CommandeService(CommandeRepository commandeRepository,
                             TransitionStatutValidator transitionStatutValidator,
                             SuccursaleClient succursaleClient,
-                            MenuClient menuClient) {
+                            MenuClient menuClient,
+                            CommandeEventPublisher commandeEventPublisher) {
         this.commandeRepository = commandeRepository;
         this.transitionStatutValidator = transitionStatutValidator;
         this.succursaleClient = succursaleClient;
         this.menuClient = menuClient;
+        this.commandeEventPublisher = commandeEventPublisher;
     }
 
     public List<Commande> listallCommande() {
@@ -99,7 +103,9 @@ public class CommandeService {
         }
         commande.setPrixTotal(prixTotal);
 
-        return commandeRepository.save(commande);
+        Commande commandeEnregistree = commandeRepository.save(commande);
+        commandeEventPublisher.publierCreation(commandeEnregistree);
+        return commandeEnregistree;
     }
 
     private SuccursaleClientDto recupererSuccursale(Long succursaleId) {
@@ -142,7 +148,9 @@ public class CommandeService {
         Commande commande = getCommandeById(id);
         transitionStatutValidator.verifierTransition(commande.getStatut(), nouveauStatut);
         commande.setStatut(nouveauStatut);
-        return commandeRepository.save(commande);
+        Commande commandeMiseAJour = commandeRepository.save(commande);
+        commandeEventPublisher.publierChangementStatut(commandeMiseAJour);
+        return commandeMiseAJour;
     }
 
     /**
